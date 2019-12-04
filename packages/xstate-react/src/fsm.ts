@@ -1,6 +1,39 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { StateMachine, EventObject, interpret } from '@xstate/fsm';
 import { AnyEventObject } from 'xstate';
+
+// TS enums don't tree-shake well
+const NotStarted = 'not started';
+const Running = 'running';
+const Stopped = 'stopped';
+
+type InterpreterStatus = typeof NotStarted | typeof Running | typeof Stopped;
+
+const interpretDev: typeof interpret = machine => {
+  const service = interpret(machine);
+  let status: InterpreterStatus = NotStarted;
+
+  return {
+    send: event => {
+      if (status !== Running) {
+        console.error(
+          `Sending events to a machine in "${status}" state might lead to unexpected results.\n` +
+            `If you want to send events to a machine you should do it after React's commit phase (so after the moment when the interpreter actually starts).`
+        );
+      }
+      service.send(event);
+    },
+    subscribe: service.subscribe,
+    start: () => {
+      status = Running;
+      return service.start();
+    },
+    stop: () => {
+      status = Stopped;
+      return service.stop();
+    }
+  };
+};
 
 export function useMachine<TC, TE extends EventObject = AnyEventObject>(
   stateMachine: StateMachine.Machine<TC, TE, any>
@@ -9,27 +42,29 @@ export function useMachine<TC, TE extends EventObject = AnyEventObject>(
   StateMachine.Service<TC, TE>['send'],
   StateMachine.Service<TC, TE>
 ] {
-  const [state, setState] = useState(stateMachine.initialState);
-  const ref = useRef<StateMachine.Service<TC, TE, any> | null>(null);
+  const initializeState = () => ({
+    machine: stateMachine,
+    service:
+      process.env.NODE_ENV !== 'production'
+        ? interpretDev(stateMachine)
+        : interpret(stateMachine),
+    state: stateMachine.initialState
+  });
+  const [{ state, service, machine }, setState] = useState(initializeState);
 
-  if (ref.current === null) {
-    ref.current = interpret(stateMachine);
+  if (stateMachine !== machine) {
+    setState(initializeState());
   }
 
   useEffect(() => {
-    if (!ref.current) {
-      return;
-    }
-
-    ref.current.subscribe(setState);
-    ref.current.start();
-
+    service.subscribe(state =>
+      setState(prevState => ({ ...prevState, state }))
+    );
+    service.start();
     return () => {
-      ref.current!.stop();
-      // reset so next call re-initializes
-      ref.current = null;
+      service.stop();
     };
-  }, [stateMachine]);
+  }, [service]);
 
-  return [state, ref.current.send, ref.current];
+  return [state, service.send, service];
 }
